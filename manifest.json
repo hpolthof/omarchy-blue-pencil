@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hpolthof.blue-pencil",
+  "name": "Blue Pencil",
+  "version": "1.0.0",
+  "author": "Paul Olthof",
+  "license": "MIT",
+  "description": "No AI slop. Write your own text, then ask the AI already on your machine for editor's notes on structure, clarity and pitfalls. It never writes for you.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Blue Pencil",
+    "description": "A writing pad with an AI editor in the margin. Notes only, so your words and your voice stay yours.",
+    "category": "Productivity",
+    "aliases": [
+      "write",
+      "writing",
+      "editor",
+      "draft",
+      "feedback",
+      "blue pencil",
+      "ai slop"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

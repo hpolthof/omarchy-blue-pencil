@@ -1,0 +1,26 @@
+import { readFileSync } from "node:fs"
+import assert from "node:assert"
+const src = readFileSync(new URL("../Model.js", import.meta.url), "utf8").replace(".pragma library", "")
+const names = ["GLYPH","KIND_LABELS","draftTitle","draftSnippet","wordCount","relativeTime","tipStats","isEmptyDraft","normalizeHistory","normalizeSettings","historyJson","nextTipId","pickProvider"]
+const M = new Function(src + "\nreturn {" + names.join(",") + "}")()
+assert.equal(M.wordCount("  a b\nc "), 3)
+assert.equal(M.draftTitle({ text: "\n  Hello world \n", goal: "x" }), "x")
+assert.equal(M.draftTitle({ text: "\n  Hello world \n", goal: "" }), "Hello world")
+assert.equal(M.draftSnippet({ text: "Hi Sam,\n\nCan we move the release?" }), "Can we move the release?")
+assert.equal(M.draftTitle({ text: "Dear neighbours,\nJoin us on Saturday.", goal: "" }), "Join us on Saturday.")
+assert.equal(M.draftTitle({ text: "", goal: "" }), "Untitled")
+const now = new Date(2026, 8, 20, 15, 0).getTime()
+assert.equal(M.relativeTime(now - 5000, now), "Just now")
+assert.equal(M.relativeTime(now - 5 * 60000, now), "5 min ago")
+assert.equal(M.relativeTime(new Date(2026, 8, 20, 9, 5).getTime(), now), "Today 09:05")
+assert.equal(M.relativeTime(new Date(2026, 8, 19, 23, 59).getTime(), now), "Yesterday 23:59")
+assert.equal(M.relativeTime(new Date(2026, 8, 12).getTime(), now), "12 Sep")
+assert.deepEqual(M.tipStats({ advice: { tips: [{ done: true }, { done: false }] } }), { total: 2, done: 1, open: 1 })
+const h = JSON.parse(M.historyJson("a", [{ id: "a", text: "", goal: "", tone: "", updatedAt: 1 }, { id: "b", text: "x", goal: "", tone: "", updatedAt: 2 }]))
+assert.equal(h.drafts.length, 1); assert.equal(h.currentId, "")
+assert.equal(M.normalizeHistory({ drafts: "no" }, 1), null)
+assert.equal(M.nextTipId([{ id: "t1" }, { id: "t4" }]), "t5")
+const ps = [{ id: "claude", installed: true, signedIn: false }, { id: "codex", installed: true, signedIn: true, defaultModel: "m", models: [{ id: "m" }] }]
+assert.deepEqual(M.pickProvider({ provider: "claude", model: "" }, ps), { provider: "codex", model: "m" })
+assert.deepEqual(M.pickProvider({ provider: "codex", model: "m" }, ps), {})
+console.log("ok")

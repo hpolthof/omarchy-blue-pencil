@@ -1,0 +1,552 @@
+#!/usr/bin/python3
+"""Blue Pencil backend: scan for AI CLIs and stream writing advice.
+
+Subcommands:  scan | advise   (see docs/CONTRACT.md)
+Stdlib only. Writes no files outside a private temp dir that it removes.
+"""
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+KINDS = ("structure", "clarity", "pitfall", "tone", "keep")
+TITLE_MAX, BODY_MAX, QUOTE_MAX = 120, 1200, 300
+OVERALL_TIMEOUT = 180
+SCAN_TIMEOUT = 20
+HOME = os.path.expanduser("~")
+EXTRA_DIRS = [os.path.join(HOME, ".local/share/mise/shims"), os.path.join(HOME, ".local/bin")]
+
+AUTH_RE = re.compile(
+    r"not logged in|not signed in|please (run )?/?login|run /login|log in|sign in|"
+    r"unauthori[sz]ed|authentication|invalid api key|invalid x-api-key|\b401\b|"
+    r"missing bearer|token (has )?expired|refresh token", re.I)
+RATE_RE = re.compile(
+    r"rate.?limit|usage limit|limit reached|hit your .*limit|quota|too many requests|\b429\b|"
+    r"out of (credits|usage)|exceeded", re.I)
+
+CLAUDE_MODELS = [("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
+
+
+# ---------------------------------------------------------------- helpers
+
+def child_env():
+    env = dict(os.environ)
+    parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+    for d in EXTRA_DIRS:
+        if d not in parts:
+            parts.append(d)
+    env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
+def find_bin(name):
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in EXTRA_DIRS:
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def run_quiet(cmd, timeout=SCAN_TIMEOUT):
+    """Run a short command; return (returncode, stdout, stderr). Raises on timeout/OS error."""
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                       stdin=subprocess.DEVNULL, env=child_env())
+    return p.returncode, p.stdout, p.stderr
+
+
+def short(text, n=300):
+    text = " ".join((text or "").split())
+    return text[-n:]
+
+
+def clean(value, limit):
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:limit]
+
+
+# ---------------------------------------------------------------- scan
+
+def scan_claude():
+    info = {"id": "claude", "name": "Claude Code", "installed": False, "signedIn": False,
+            "version": "", "models": [], "defaultModel": "", "error": ""}
+    exe = find_bin("claude")
+    if not exe:
+        return info
+    info["installed"] = True
+    info["models"] = [{"id": i, "name": n} for i, n in CLAUDE_MODELS]
+    info["defaultModel"] = "sonnet"
+    try:
+        _, out, _ = run_quiet([exe, "--version"])
+        m = re.search(r"\d+\.\d+(\.\d+)?", out)
+        info["version"] = m.group(0) if m else out.strip()[:40]
+    except Exception as e:  # noqa: BLE001
+        info["error"] = "Could not read version: %s" % short(str(e), 100)
+    try:
+        rc, out, err = run_quiet([exe, "auth", "status"])
+        try:
+            info["signedIn"] = bool(json.loads(out).get("loggedIn"))
+        except ValueError:
+            info["signedIn"] = False
+            if not info["error"]:
+                info["error"] = short(err or out, 200)
+    except Exception as e:  # noqa: BLE001
+        info["error"] = "Could not check sign-in: %s" % short(str(e), 100)
+    return info
+
+
+def scan_codex():
+    info = {"id": "codex", "name": "Codex", "installed": False, "signedIn": False,
+            "version": "", "models": [], "defaultModel": "", "error": ""}
+    exe = find_bin("codex")
+    if not exe:
+        return info
+    info["installed"] = True
+    try:
+        _, out, _ = run_quiet([exe, "--version"])
+        m = re.search(r"\d+\.\d+(\.\d+)?", out)
+        info["version"] = m.group(0) if m else out.strip()[:40]
+    except Exception as e:  # noqa: BLE001
+        info["error"] = "Could not read version: %s" % short(str(e), 100)
+    try:
+        rc, out, err = run_quiet([exe, "login", "status"])
+        text = out + " " + err
+        info["signedIn"] = rc == 0 and bool(re.search(r"logged in", text, re.I)) \
+            and not re.search(r"not logged in", text, re.I)
+    except Exception as e:  # noqa: BLE001
+        info["error"] = "Could not check sign-in: %s" % short(str(e), 100)
+    try:
+        rc, out, err = run_quiet([exe, "debug", "models"])
+        data = json.loads(out)
+        models = []
+        for m in data.get("models", []):
+            if m.get("visibility") == "list" and m.get("slug"):
+                models.append({"id": m["slug"], "name": m.get("display_name") or m["slug"]})
+        info["models"] = models
+        info["defaultModel"] = models[0]["id"] if models else ""
+    except Exception as e:  # noqa: BLE001
+        if not info["error"]:
+            info["error"] = "Could not list models: %s" % short(str(e), 100)
+    return info
+
+
+def cmd_scan():
+    results = [None, None]
+
+    def work(i, fn):
+        try:
+            results[i] = fn()
+        except Exception as e:  # noqa: BLE001
+            results[i] = {"id": ("claude", "codex")[i], "name": ("Claude Code", "Codex")[i],
+                          "installed": False, "signedIn": False, "version": "", "models": [],
+                          "defaultModel": "", "error": short(str(e), 200)}
+
+    threads = [threading.Thread(target=work, args=(0, scan_claude)),
+               threading.Thread(target=work, args=(1, scan_codex))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    sys.stdout.write(json.dumps({"providers": results}, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+# ---------------------------------------------------------------- advise: parsing
+
+def parse_tip(line):
+    """Return a normalised tip dict for one output line, or None."""
+    line = line.strip()
+    if not line.startswith("{") or not line.endswith("}"):
+        return None
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    kind = obj.get("kind")
+    kind = kind.strip().lower() if isinstance(kind, str) else ""
+    if kind not in KINDS:
+        return None
+    title = clean(obj.get("title"), TITLE_MAX)
+    if not title:
+        return None
+    return {"kind": kind, "title": title, "body": clean(obj.get("body"), BODY_MAX),
+            "quote": clean(obj.get("quote"), QUOTE_MAX)}
+
+
+CODEX_DISABLED_FEATURES = (
+    "shell_tool", "unified_exec", "apps", "plugins", "browser_use",
+    "browser_use_external", "computer_use", "image_generation",
+    "in_app_browser", "view_image", "skill_search", "tool_suggest",
+)
+
+
+class TipStream:
+    """Feeds text deltas; yields complete tips as lines complete."""
+
+    def __init__(self):
+        self.buf = ""
+
+    def feed(self, text):
+        self.buf += text
+        tips = []
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            t = parse_tip(line)
+            if t:
+                tips.append(t)
+        return tips
+
+    def finish(self):
+        line, self.buf = self.buf, ""
+        t = parse_tip(line)
+        return [t] if t else []
+
+
+def clamp_max_tips(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = 6
+    return max(3, min(10, n))
+
+
+def load_system_prompt(max_tips):
+    here = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.join(here, "..", "prompts", "system.md")
+    with open(path, encoding="utf-8") as f:
+        return f.read().replace("{{MAX_TIPS}}", str(max_tips))
+
+
+def build_user_message(goal, tone, text):
+    return ("<goal>\n%s\n</goal>\n\n<tone>\n%s\n</tone>\n\n<draft>\n%s\n</draft>\n\n"
+            "Review the draft above. Reply with JSON Lines only: one JSON object per line, "
+            "nothing else." % ((goal or "").strip(), (tone or "").strip(), text))
+
+
+def classify_failure(text, default_code="failed"):
+    if AUTH_RE.search(text or ""):
+        return "not-signed-in"
+    if RATE_RE.search(text or ""):
+        return "rate-limit"
+    return default_code
+
+
+# Provider adapters. Each handles one decoded JSON event line from the child's stdout
+# and returns (kind, payload): ("init", None) | ("text", str) | ("error", str) | (None, None)
+
+class ClaudeAdapter:
+    id, label, binary = "claude", "Claude", "claude"
+
+    def __init__(self):
+        self.saw_delta = False
+
+    def command(self, exe, model, system_prompt, workdir):
+        cmd = [exe, "-p", "--output-format", "stream-json", "--verbose",
+               "--include-partial-messages", "--system-prompt", system_prompt,
+               "--tools", "", "--no-session-persistence", "--setting-sources", "",
+               "--strict-mcp-config", "--disable-slash-commands"]
+        if model:
+            cmd += ["--model", model]
+        return cmd
+
+    def stdin_data(self, system_prompt, user_message):
+        return user_message
+
+    def handle(self, ev):
+        t = ev.get("type")
+        if t == "system" and ev.get("subtype") == "init":
+            return "init", None
+        if t == "stream_event":
+            e = ev.get("event") or {}
+            if e.get("type") == "content_block_delta":
+                d = e.get("delta") or {}
+                if d.get("type") == "text_delta" and d.get("text"):
+                    self.saw_delta = True
+                    return "text", d["text"]
+            elif e.get("type") == "message_stop" and self.saw_delta:
+                return "text", "\n"
+            return None, None
+        if t == "assistant" and not self.saw_delta:
+            parts = [b.get("text", "") for b in (ev.get("message") or {}).get("content", [])
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            if parts:
+                return "text", "".join(parts) + "\n"
+            return None, None
+        if t == "result":
+            if ev.get("is_error"):
+                return "error", str(ev.get("result") or ev.get("subtype") or "")
+            if not self.saw_delta and isinstance(ev.get("result"), str):
+                return "text", ev["result"] + "\n"
+        return None, None
+
+
+class CodexAdapter:
+    id, label, binary = "codex", "Codex", "codex"
+
+    def command(self, exe, model, system_prompt, workdir):
+        cmd = [exe, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+               "-s", "read-only", "-C", workdir,
+               "-c", "developer_instructions=" + json.dumps(system_prompt),
+               "-c", 'web_search="disabled"']
+        # A writing coach needs no tools: switch off everything that can
+        # run commands, browse, or reach other apps.
+        for feature in CODEX_DISABLED_FEATURES:
+            cmd += ["--disable", feature]
+        if model:
+            cmd += ["-m", model]
+        return cmd + ["-"]
+
+    def stdin_data(self, system_prompt, user_message):
+        return user_message
+
+    def handle(self, ev):
+        t = ev.get("type")
+        if t in ("thread.started", "turn.started"):
+            return "init", None
+        if t == "item.completed":
+            item = ev.get("item") or {}
+            if item.get("type") == "agent_message" and item.get("text"):
+                return "text", item["text"] + "\n"
+        elif t == "turn.failed":
+            return "error", str((ev.get("error") or {}).get("message") or "")
+        elif t == "error":
+            return "error", str(ev.get("message") or "")
+        return None, None
+
+
+ADAPTERS = {"claude": ClaudeAdapter, "codex": CodexAdapter}
+
+
+# ---------------------------------------------------------------- advise: run
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def kill_group(proc):
+    if proc is None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def cmd_advise(stdin=None):
+    try:
+        req = json.loads((stdin or sys.stdin).read())
+        if not isinstance(req, dict):
+            raise ValueError("not an object")
+    except ValueError:
+        emit({"type": "error", "code": "failed", "message": "The request was not valid JSON."})
+        return 1
+
+    provider = req.get("provider")
+    text = req.get("text") if isinstance(req.get("text"), str) else ""
+    if not text.strip():
+        emit({"type": "error", "code": "empty-text", "message": "There is no text to review yet."})
+        return 1
+    if provider not in ADAPTERS:
+        emit({"type": "error", "code": "failed", "message": "Unknown provider."})
+        return 1
+    model = req.get("model") if isinstance(req.get("model"), str) else ""
+    max_tips = clamp_max_tips(req.get("maxTips"))
+    adapter = ADAPTERS[provider]()
+
+    try:
+        system_prompt = load_system_prompt(max_tips)
+    except OSError:
+        emit({"type": "error", "code": "failed", "message": "The coaching prompt file is missing."})
+        return 1
+
+    exe = find_bin(adapter.binary)
+    emit({"type": "status", "phase": "starting", "message": "Starting %s…" % adapter.label})
+    if not exe:
+        emit({"type": "error", "code": "not-installed",
+              "message": "%s is not installed." % adapter.label})
+        return 1
+
+    workdir = tempfile.mkdtemp(prefix="blue-pencil-")
+    state = {"proc": None}
+
+    def cleanup():
+        kill_group(state["proc"])
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    def on_signal(signum, _frame):
+        cleanup()
+        os._exit(143)
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    try:
+        return run_child(adapter, exe, model, system_prompt,
+                         build_user_message(req.get("goal"), req.get("tone"), text),
+                         workdir, state, max_tips)
+    finally:
+        cleanup()
+
+
+def run_child(adapter, exe, model, system_prompt, user_message, workdir, state, max_tips):
+    cmd = adapter.command(exe, model, system_prompt, workdir)
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, cwd=workdir, env=child_env(),
+                                start_new_session=True)
+    except OSError as e:
+        emit({"type": "error", "code": "failed",
+              "message": "Could not start %s: %s" % (adapter.label, short(str(e), 200))})
+        return 1
+    state["proc"] = proc
+
+    q = queue.Queue()
+    stderr_chunks = []
+
+    def pump_out():
+        for raw in proc.stdout:
+            q.put(raw)
+        q.put(None)
+
+    def pump_err():
+        for raw in proc.stderr:
+            stderr_chunks.append(raw.decode("utf-8", "replace"))
+            del stderr_chunks[:-50]
+
+    def feed_in():
+        try:
+            proc.stdin.write(adapter.stdin_data(system_prompt, user_message).encode("utf-8"))
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    for fn in (pump_out, pump_err, feed_in):
+        threading.Thread(target=fn, daemon=True).start()
+
+    stream = TipStream()
+    tips = 0
+    phase = "starting"
+    child_error = ""
+    deadline = time.time() + OVERALL_TIMEOUT
+    capped = False
+
+    def set_phase(name, msg):
+        nonlocal phase
+        order = ("starting", "reading", "writing")
+        if order.index(name) > order.index(phase):
+            phase = name
+            emit({"type": "status", "phase": name, "message": msg})
+
+    def take(new_tips):
+        nonlocal tips, capped
+        for t in new_tips:
+            if tips >= max_tips:
+                capped = True
+                return
+            tips += 1
+            emit({"type": "tip", "tip": t})
+        if tips >= max_tips:
+            capped = True
+
+    while not capped:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            emit({"type": "error", "code": "timeout",
+                  "message": "The AI took too long to answer (over %d seconds)." % OVERALL_TIMEOUT})
+            return 1
+        try:
+            raw = q.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            continue
+        if raw is None:
+            break
+        try:
+            ev = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        kind, payload = adapter.handle(ev)
+        if kind == "init":
+            set_phase("reading", "Reading your text…")
+        elif kind == "text":
+            set_phase("reading", "Reading your text…")
+            set_phase("writing", "Writing notes…")
+            take(stream.feed(payload))
+        elif kind == "error":
+            child_error = payload or child_error
+    if not capped:
+        take(stream.finish())
+
+    if capped:
+        kill_group(proc)
+    else:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            kill_group(proc)
+        time.sleep(0.05)  # let stderr pump drain
+
+    if tips > 0:
+        emit({"type": "done", "count": tips})
+        return 0
+
+    err_tail = short("".join(stderr_chunks), 300)
+    combined = child_error + " " + err_tail
+    code = classify_failure(combined, "")
+    if code == "not-signed-in":
+        msg = "%s is not signed in." % adapter.label
+    elif code == "rate-limit":
+        msg = "%s hit a usage or rate limit. Try again later." % adapter.label
+    elif child_error or (proc.returncode not in (0, None)):
+        code = "failed"
+        msg = "%s failed: %s" % (adapter.label, short(child_error or err_tail or
+                                  "exit code %s" % proc.returncode, 300))
+    else:
+        code = "bad-output"
+        msg = "%s answered, but not in a form Blue Pencil could read." % adapter.label
+    emit({"type": "error", "code": code, "message": msg})
+    return 1
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ("scan", "advise"):
+        sys.stderr.write("usage: blue-pencil scan|advise\n")
+        return 2
+    try:
+        return cmd_scan() if argv[1] == "scan" else cmd_advise()
+    except BrokenPipeError:
+        return 1
+    except Exception as e:  # noqa: BLE001
+        if argv[1] == "advise":
+            emit({"type": "error", "code": "failed", "message": "Unexpected error: %s" % short(str(e), 200)})
+        else:
+            sys.stderr.write("error: %s\n" % short(str(e), 200))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
