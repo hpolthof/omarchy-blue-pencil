@@ -20,6 +20,15 @@ KINDS = ("structure", "clarity", "pitfall", "tone", "keep")
 TITLE_MAX, BODY_MAX, QUOTE_MAX = 120, 1200, 300
 OVERALL_TIMEOUT = 180
 SCAN_TIMEOUT = 20
+
+# Hard limits on everything read from a child process or from stdin, so a
+# misbehaving CLI cannot make this helper (or the shell) hold unbounded data.
+MAX_REQUEST_BYTES = 4 * 1024 * 1024      # the request JSON, draft included
+MAX_SCAN_OUTPUT = 1024 * 1024            # stdout/stderr of each scan command
+MAX_EVENT_LINE = 4 * 1024 * 1024         # one JSON event line from the CLI
+MAX_STREAM_BYTES = 32 * 1024 * 1024      # all CLI stdout for one request
+MAX_STDERR_LINE = 4096                   # stderr is only kept as a short tail
+MAX_TIP_LINE = 64 * 1024                 # one tip line of model text
 HOME = os.path.expanduser("~")
 EXTRA_DIRS = [os.path.join(HOME, ".local/share/mise/shims"), os.path.join(HOME, ".local/bin")]
 
@@ -57,11 +66,38 @@ def find_bin(name):
     return None
 
 
+def _read_capped(stream, limit, sink):
+    """Read up to `limit` bytes into sink[0]; drain (and drop) the rest."""
+    data = bytearray()
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        room = limit - len(data)
+        if room > 0:
+            data += chunk[:room]
+    sink[0] = bytes(data)
+
+
 def run_quiet(cmd, timeout=SCAN_TIMEOUT):
-    """Run a short command; return (returncode, stdout, stderr). Raises on timeout/OS error."""
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                       stdin=subprocess.DEVNULL, env=child_env())
-    return p.returncode, p.stdout, p.stderr
+    """Run a short command; return (returncode, stdout, stderr). Raises on timeout/OS error.
+
+    Output is capped at MAX_SCAN_OUTPUT per stream; the command is killed on timeout."""
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=child_env(), start_new_session=True)
+    out, err = [b""], [b""]
+    readers = [threading.Thread(target=_read_capped, args=(p.stdout, MAX_SCAN_OUTPUT, out), daemon=True),
+               threading.Thread(target=_read_capped, args=(p.stderr, MAX_SCAN_OUTPUT, err), daemon=True)]
+    for t in readers:
+        t.start()
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        raise
+    for t in readers:
+        t.join(timeout=2)
+    return (p.returncode, out[0].decode("utf-8", "replace"), err[0].decode("utf-8", "replace"))
 
 
 def short(text, n=300):
@@ -201,6 +237,9 @@ class TipStream:
 
     def feed(self, text):
         self.buf += text
+        # No tip line is legitimately this long; drop runaway text without a newline.
+        if len(self.buf) > MAX_TIP_LINE and "\n" not in self.buf:
+            self.buf = ""
         tips = []
         while "\n" in self.buf:
             line, self.buf = self.buf.split("\n", 1)
@@ -357,7 +396,11 @@ def kill_group(proc):
 
 def cmd_advise(stdin=None):
     try:
-        req = json.loads((stdin or sys.stdin).read())
+        raw = (stdin or sys.stdin).read(MAX_REQUEST_BYTES + 1)
+        if len(raw) > MAX_REQUEST_BYTES:
+            emit({"type": "error", "code": "failed", "message": "The text is too long to send for advice."})
+            return 1
+        req = json.loads(raw)
         if not isinstance(req, dict):
             raise ValueError("not an object")
     except ValueError:
@@ -427,12 +470,24 @@ def run_child(adapter, exe, model, system_prompt, user_message, workdir, state, 
     stderr_chunks = []
 
     def pump_out():
-        for raw in proc.stdout:
+        total = 0
+        while True:
+            raw = proc.stdout.readline(MAX_EVENT_LINE)
+            if not raw:
+                break
+            total += len(raw)
+            if total > MAX_STREAM_BYTES or (len(raw) >= MAX_EVENT_LINE and not raw.endswith(b"\n")):
+                q.put(b"\x00overflow")
+                kill_group(proc)
+                break
             q.put(raw)
         q.put(None)
 
     def pump_err():
-        for raw in proc.stderr:
+        while True:
+            raw = proc.stderr.readline(MAX_STDERR_LINE)
+            if not raw:
+                break
             stderr_chunks.append(raw.decode("utf-8", "replace"))
             del stderr_chunks[:-50]
 
@@ -483,6 +538,10 @@ def run_child(adapter, exe, model, system_prompt, user_message, workdir, state, 
             continue
         if raw is None:
             break
+        if raw == b"\x00overflow":
+            emit({"type": "error", "code": "bad-output",
+                  "message": "%s sent more output than Blue Pencil accepts." % adapter.label})
+            return 1
         try:
             ev = json.loads(raw.decode("utf-8", "replace"))
         except ValueError:

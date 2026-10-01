@@ -253,6 +253,49 @@ class FakeCliTests(unittest.TestCase):
         self.assertEqual((x["version"], x["signedIn"], x["models"], x["defaultModel"]),
                          ("1.2.3", True, [{"id": "a", "name": "A"}], "a"))
 
+    # ---- limits: nothing a CLI prints may grow without bound
+
+    def test_oversized_event_line_is_rejected(self):
+        # 5 MiB on one line, no newline: must stop with bad-output, not buffer it all.
+        self.fake("claude", """
+            import sys
+            sys.stdin.read()
+            sys.stdout.write("x" * (5 * 1024 * 1024))
+            sys.stdout.flush()
+        """)
+        rc, ev = self.advise({"provider": "claude", "model": "haiku", "text": "Hello"})
+        self.assertEqual(rc, 1)
+        self.assertEqual(ev[-1]["type"], "error")
+        self.assertEqual(ev[-1]["code"], "bad-output")
+
+    def test_huge_stderr_line_is_bounded(self):
+        self.fake("claude", """
+            import sys
+            sys.stdin.read()
+            sys.stderr.write("e" * (3 * 1024 * 1024))
+            sys.exit(2)
+        """)
+        rc, ev = self.advise({"provider": "claude", "model": "haiku", "text": "Hello"})
+        self.assertEqual(rc, 1)
+        self.assertLess(len(ev[-1]["message"]), 400)
+
+    def test_oversized_request_is_rejected(self):
+        rc, ev = self.advise({"provider": "claude", "text": "a" * (5 * 1024 * 1024)})
+        self.assertEqual(rc, 1)
+        self.assertEqual(ev[-1]["code"], "failed")
+
+    def test_scan_output_is_capped(self):
+        self.fake("claude", """
+            import sys
+            if "--version" in sys.argv: sys.stdout.write("9.9.9 " + "v" * (3 * 1024 * 1024))
+            else: print('{"loggedIn": true}')
+        """)
+        env = dict(os.environ, PATH=self.bin + os.pathsep + "/usr/bin:/bin", HOME=self.tmp.name)
+        p = subprocess.run([SCRIPT, "scan"], capture_output=True, text=True, env=env, timeout=60)
+        c = json.loads(p.stdout)["providers"][0]
+        self.assertTrue(c["installed"])
+        self.assertLess(len(p.stdout), 64 * 1024)
+
 
 if __name__ == "__main__":
     unittest.main()

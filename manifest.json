@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.hpolthof.blue-pencil",
   "name": "Blue Pencil",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Paul Olthof",
   "license": "MIT",
   "description": "No AI slop. Write your own text, then ask the AI already on your machine for editor's notes on structure, clarity and pitfalls. It never writes for you.",

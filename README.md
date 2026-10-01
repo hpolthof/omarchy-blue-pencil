@@ -125,6 +125,9 @@ omarchy-shell io.github.hpolthof.blue-pencil toggle
   sandbox, web search off and its shell, browser, apps and plugin features
   disabled.
 - All text from you or the AI is rendered as plain text.
+- Everything read back from the CLI is size-limited (event lines, total
+  output, error output, the scan), and every call has a timeout, so a
+  misbehaving tool cannot make Blue Pencil hold unbounded data.
 
 ### Where things are stored
 
@@ -133,9 +136,22 @@ omarchy-shell io.github.hpolthof.blue-pencil toggle
 | Texts, notes and ticks | `~/.local/state/omarchy/blue-pencil/history.json` |
 | Settings (provider, model, max notes, last scan) | `~/.config/omarchy/blue-pencil/settings.json` |
 
-Both are written atomically. Remove the plugin with
-`omarchy plugin remove io.github.hpolthof.blue-pencil`; delete the two folders
-above if you also want your texts gone.
+Both are written atomically.
+
+## Uninstall
+
+```bash
+omarchy plugin remove io.github.hpolthof.blue-pencil
+```
+
+This removes the plugin and its bar button. Blue Pencil installs nothing
+outside its own plugin folder and binds no shortcuts, so there is nothing else
+to undo. Your texts and settings stay where they are in case you come back;
+to remove those as well:
+
+```bash
+rm -rf ~/.local/state/omarchy/blue-pencil ~/.config/omarchy/blue-pencil
+```
 
 ## How it works
 
