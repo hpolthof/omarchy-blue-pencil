@@ -90,9 +90,27 @@ class ParseTests(unittest.TestCase):
         cmd = bp.ClaudeAdapter().command("claude", "haiku", "SYS", "/w")
         self.assertIn("--tools", cmd)
         self.assertEqual(cmd[cmd.index("--tools") + 1], "")
-        cmd = bp.CodexAdapter().command("codex", "m", "SYS\nline", "/w")
+        x = bp.CodexAdapter()
+        with self.assertRaises(bp.UnsafeConfig):
+            x.command("codex", "m", "SYS", "/w")   # never without a preflight
+        x.isolation = ["--disable", "shell_tool"]
+        cmd = x.command("codex", "m", "SYS\nline", "/w")
         self.assertEqual(cmd[-1], "-")
         self.assertIn('developer_instructions="SYS\\nline"', cmd)
+        self.assertIn("shell_tool", cmd)
+
+    def test_tool_use_is_a_violation(self):
+        c = bp.ClaudeAdapter()
+        self.assertEqual(c.handle({"type": "system", "subtype": "init", "tools": ["Bash"]})[0], "violation")
+        self.assertEqual(c.handle({"type": "system", "subtype": "init", "tools": [],
+                                   "mcp_servers": [{"name": "x"}]})[0], "violation")
+        self.assertEqual(c.handle({"type": "system", "subtype": "init", "tools": [], "mcp_servers": []})[0], "init")
+        self.assertEqual(c.handle({"type": "stream_event", "event": {"type": "content_block_start",
+                         "content_block": {"type": "tool_use", "name": "Bash"}}})[0], "violation")
+        x = bp.CodexAdapter()
+        for kind in ("mcp_tool_call", "command_execution", "file_change", "web_search"):
+            self.assertEqual(x.handle({"type": "item.started", "item": {"type": kind}})[0], "violation")
+        self.assertEqual(x.handle({"type": "item.completed", "item": {"type": "reasoning"}})[0], None)
 
 
 class FakeCliTests(unittest.TestCase):
@@ -103,11 +121,29 @@ class FakeCliTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def fake(self, name, body):
+    def fake(self, name, body, prelude=""):
         path = os.path.join(self.bin, name)
         with open(path, "w") as f:
-            f.write("#!/usr/bin/python3\n" + textwrap.dedent(body))
+            f.write("#!/usr/bin/python3\n" + textwrap.dedent(prelude) + textwrap.dedent(body))
         os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+
+    # A fake Codex that answers the tool-isolation preflight like the real one:
+    # two enabled features and one MCP server that can be switched off with -c.
+    CODEX_PRELUDE = """
+        import sys as _s, json as _j, os as _o
+        _a = _s.argv[1:]
+        if _a[:2] == ["features", "list"]:
+            print("shell_tool  stable  true\\nhooks  stable  true\\nmemories  stable  false")
+            _s.exit(0)
+        if _a[:2] == ["mcp", "list"]:
+            _off = "mcp_servers.node_repl.enabled=false" in _a and not _o.environ.get("STUBBORN")
+            print(_j.dumps([{"name": "node_repl", "enabled": not _off}]))
+            _s.exit(0)
+        open(_o.path.join(_o.path.dirname(_s.argv[0]), "exec-argv"), "w").write(_j.dumps(_a))
+    """
+
+    def fake_codex(self, body):
+        self.fake("codex", body, self.CODEX_PRELUDE)
 
     def advise(self, req, home=None):
         env = dict(os.environ, PATH=self.bin + os.pathsep + "/usr/bin:/bin", HOME=home or self.tmp.name)
@@ -166,7 +202,7 @@ class FakeCliTests(unittest.TestCase):
         self.assertEqual(ev[-1]["code"], "not-signed-in")
 
     def test_rate_limit_stderr(self):
-        self.fake("codex", """
+        self.fake_codex("""
             import sys
             sys.stdin.read()
             sys.stderr.write("You've hit your usage limit")
@@ -176,7 +212,7 @@ class FakeCliTests(unittest.TestCase):
         self.assertEqual(ev[-1]["code"], "rate-limit")
 
     def test_generic_failure(self):
-        self.fake("codex", """
+        self.fake_codex("""
             import sys
             sys.stdin.read()
             sys.stderr.write("kaboom")
@@ -187,7 +223,7 @@ class FakeCliTests(unittest.TestCase):
         self.assertIn("kaboom", ev[-1]["message"])
 
     def test_codex_stream_and_stdin_not_argv(self):
-        self.fake("codex", """
+        self.fake_codex("""
             import sys, json
             data = sys.stdin.read()
             assert "SECRETDRAFT" in data and not any("SECRETDRAFT" in a for a in sys.argv)
@@ -295,6 +331,61 @@ class FakeCliTests(unittest.TestCase):
         c = json.loads(p.stdout)["providers"][0]
         self.assertTrue(c["installed"])
         self.assertLess(len(p.stdout), 64 * 1024)
+
+    # ---- tool isolation (marketplace review, Oct 2026)
+
+    def test_codex_preflight_disables_features_and_mcp(self):
+        self.fake_codex("""
+            import sys, json
+            sys.stdin.read()
+            print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":%r}}), flush=True)
+        """ % tip_line())
+        rc, ev = self.advise({"provider": "codex", "text": "hello"})
+        self.assertEqual(rc, 0)
+        argv = json.load(open(os.path.join(self.bin, "exec-argv")))
+        self.assertIn("mcp_servers.node_repl.enabled=false", argv)
+        for f in ("shell_tool", "hooks"):
+            self.assertIn(f, argv)
+        self.assertNotIn("memories", argv)   # only features that are on get switched off
+
+    def test_codex_refuses_when_mcp_stays_enabled(self):
+        self.fake_codex("""
+            import sys
+            sys.exit(0)
+        """)
+        env_backup = os.environ.get("STUBBORN")
+        os.environ["STUBBORN"] = "1"
+        try:
+            rc, ev = self.advise({"provider": "codex", "text": "hello"})
+        finally:
+            os.environ.pop("STUBBORN", None)
+        self.assertEqual(rc, 1)
+        self.assertEqual(ev[-1]["code"], "unsafe")
+        self.assertFalse(os.path.exists(os.path.join(self.bin, "exec-argv")))  # draft never sent
+
+    def test_codex_tool_call_stops_the_run(self):
+        self.fake_codex("""
+            import sys, json, time
+            sys.stdin.read()
+            print(json.dumps({"type":"item.started","item":{"type":"mcp_tool_call","server":"x","tool":"y"}}), flush=True)
+            time.sleep(5)
+            print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":%r}}), flush=True)
+        """ % tip_line())
+        rc, ev = self.advise({"provider": "codex", "text": "hello"})
+        self.assertEqual(rc, 1)
+        self.assertEqual(ev[-1]["code"], "unsafe")
+        self.assertFalse(any(e["type"] == "tip" for e in ev))
+
+    def test_claude_with_tools_is_refused(self):
+        self.fake("claude", """
+            import sys, json, time
+            sys.stdin.read()
+            print(json.dumps({"type":"system","subtype":"init","tools":["Bash"],"mcp_servers":[]}), flush=True)
+            time.sleep(5)
+        """)
+        rc, ev = self.advise({"provider": "claude", "text": "hello"})
+        self.assertEqual(rc, 1)
+        self.assertEqual(ev[-1]["code"], "unsafe")
 
 
 if __name__ == "__main__":

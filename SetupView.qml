@@ -68,13 +68,16 @@ Item {
   // Start where the user's choice is, so the cursor highlight and the
   // selection agree; before any scan that is the scan button.
   function _initialCursor() {
-    for (var i = 0; i < providers.length; i++) {
-      if (providers[i] && providers[i].id === providerId) {
-        var at = stops.indexOf("p" + i)
+    // Also runs while the view is still being built, before stops exist.
+    var st = Array.isArray(stops) ? stops : []
+    var pv = Array.isArray(providers) ? providers : []
+    for (var i = 0; i < pv.length; i++) {
+      if (pv[i] && pv[i].id === providerId) {
+        var at = st.indexOf("p" + i)
         if (at >= 0) return at
       }
     }
-    var scan = stops.indexOf("scan")
+    var scan = st.indexOf("scan")
     return scan >= 0 ? scan : 0
   }
 

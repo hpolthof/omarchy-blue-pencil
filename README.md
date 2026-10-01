@@ -120,10 +120,18 @@ omarchy-shell io.github.hpolthof.blue-pencil toggle
 - The text is passed to the CLI on standard input, never on the command line,
   so it does not show up in process listings.
 - The CLI runs headless in an empty temporary directory that is removed
-  afterwards, with **no tools**: Claude Code with `--tools ""` and no
-  settings, MCP servers, skills or session history; Codex with a read-only
-  sandbox, web search off and its shell, browser, apps and plugin features
-  disabled.
+  afterwards, and **without tools — or not at all**:
+  - **Claude Code** runs with `--tools ""`, `--strict-mcp-config` and no
+    settings, skills or session history. Blue Pencil checks Claude's own
+    start-up report and stops unless it lists no tools and no MCP servers.
+  - **Codex** runs in a read-only sandbox with web search off. Before your
+    text is sent, Blue Pencil switches off every Codex feature that is
+    currently enabled and every MCP server Codex would start (including the
+    ones in your own `~/.codex/config.toml`), then asks Codex's own
+    `codex mcp list` to confirm none is left. If that cannot be confirmed,
+    nothing is sent.
+  - If either CLI still starts a tool call while answering, the run is
+    stopped at once and no notes are shown.
 - All text from you or the AI is rendered as plain text.
 - Everything read back from the CLI is size-limited (event lines, total
   output, error output, the scan), and every call has a timeout, so a

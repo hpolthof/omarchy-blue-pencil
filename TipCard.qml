@@ -118,7 +118,6 @@ Rectangle {
     Text {
       visible: root.showBody
       width: parent.width
-      height: visible ? implicitHeight : 0
       textFormat: Text.PlainText
       text: root.tip && root.tip.body ? String(root.tip.body) : ""
       color: root.done ? root.dim : Qt.darker(root.foreground, 1.15)

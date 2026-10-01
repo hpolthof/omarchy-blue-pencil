@@ -201,6 +201,7 @@ Item {
             : root.errorCode === "not-installed" ? "Run a scan in Settings."
             : root.errorCode === "rate-limit" ? "The AI service is rate limiting you. Wait a moment and ask again."
             : root.errorCode === "timeout" ? "That took too long. Try again, or a shorter text."
+            : root.errorCode === "unsafe" ? "Blue Pencil only sends your text to an AI that runs without tools. Try the other provider in Settings."
             : ""
         color: root.dim
         font.family: Style.font.family
